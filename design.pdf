@@ -1,0 +1,93 @@
+Part 1 - 
+---------------------------------------------------------
+1. Row Key and Sharding
+The proposed row key for this dataset is a composite of 
+State#City#VIN. This design balances write distribution 
+and query efficiency. The VIN component guarantees 
+uniqueness for every record, while the geographic prefix 
+groups related vehicles together for efficient range scans. 
+Hotspotting occurs when too many writes concentrate on the 
+same tablet server — for example, using Model Year alone 
+as a row key would send every 2024 registration to a single 
+node. The composite key avoids this because writes are naturally 
+spread across hundreds of city prefixes across the state, 
+and no single prefix dominates traffic volume. For querying by 
+City, this row key is efficient. A prefix scan on WA#Seattle# 
+retrieves all Seattle vehicles in one contiguous range scan 
+without touching other tablets. Querying by Make, however,
+is not directly supported by this row key since Make does 
+not appear in the key, finding all Tesla vehicles requires 
+a full table scan. To handle Make-based queries efficiently, 
+a secondary index table with row key Make#City#VIN would be
+maintained in parallel.
+
+2. Column Families
+Bigtable stores each column family in a separate SSTable file 
+on disk, meaning reads only load the families they actually need.
+The proposed design uses four column families grouped by access
+pattern. The first, vehicle_identity, contains VIN, Make, Model,
+Model Year, and Electric Vehicle Type. This family is queried most
+frequently and keeping it isolated means a count-by-make query 
+loads only this small family rather than pulling in unrelated data. 
+The second family, location, contains County, City, State, Postal Code, 
+Legislative District, Census Tract, and GPS coordinates. Geographic 
+attributes are almost always queried together for regional analysis, 
+so isolating them prevents map-visualization workloads from loading 
+pricing or utility data unnecessarily. The third family, ev_specs, 
+holds Electric Range, Base MSRP, and CAFV Eligibility. These specification
+fields are queried primarily for analytical workloads such as computing 
+average range by make, and separating them avoids loading spec data during 
+simple vehicle lookups. The fourth family, utility, contains Electric
+Utility and DOL Vehicle ID, which are administrative fields queried 
+rarely and can be stored with lower cache priority.
+This design improves distributed read performance because when a query targets
+only Make and Model Year, Bigtable loads only the vehicle_identity SSTable 
+files for the relevant tablet — the other three families are never read from disk. 
+Different families can also be cached independently across nodes, allowing hot
+analytical families to stay in memory while cold administrative data is evicted.
+
+3. Horizontal Scaling
+A hashed shard key on VIN distributes writes perfectly uniformly across
+all nodes because VINs produce random hash outputs with no clustering. 
+This eliminates hotspotting even during write spikes such as end-of-year 
+vehicle registration surges. Lookups by a single VIN are also efficient
+since the hash function routes directly to exactly one shard in O(1) time. 
+The major drawback is that range queries become impossible as retrieving all 2022
+vehicles requires querying every shard simultaneously (scatter-gather), 
+which increases latency and cluster load proportionally to the number of shards. 
+Rebalancing is straightforward with consistent hashing since data redistributes 
+evenly when nodes are added.
+A range-based shard key on Model Year has the opposite tradeoff.
+Range scans are highly efficient — a query for all 2020–2022 vehicles reads a 
+small contiguous set of tablets. However, this design causes severe hotspotting in practice. 
+All newly registered vehicles in the current model year write to the same shard,
+creating a bottleneck while older year shards sit idle. Cluster rebalancing also 
+becomes uneven since popular year ranges produce large tablets that split 
+frequently while sparse years remain small.
+For this EV dataset, where the dominant workload is individual vehicle 
+lookups and high-throughput registration inserts, the hashed shard key
+on VIN is the better choice. It prevents write hotspotting at the cost
+of scatter-gather for year-based analytics. If the primary workload 
+were temporal batch analysis such as computing adoption trends across model years. 
+A range-based key with a salted prefix to mitigate hotspotting would be more appropriate.
+
+Part 4 - 
+---------------------------------------------------------
+The measured latency difference between w=1 (~107ms avg) 
+and w=majority (~104ms avg) was negligible (~3ms) because 
+all three Atlas replica nodes are co-located within the 
+same cloud region. The dominant cost (~100ms) is the network
+round-trip between the GCP VM and the Atlas cluster, which
+both write concerns must pay equally. The theoretical 
+advantage of w=1 which skips the secondary acknowledgment  
+only becomes significant in geo-distributed deployments 
+where secondaries are in different regions, potentially 
+adding 50–200ms per write. 
+CAP Theorem scenario for w=1: A real-time multiplayer 
+game recording millions of player movement events per second 
+is a strong use case for w=1. Under CAP, this prioritizes
+Availability and Partition Tolerance over Consistency as 
+losing a few position-update writes during a primary failover
+is acceptable because the data is transient, immediately 
+superseded by the next update, and no financial or safety
+consequence follows from the loss.
